@@ -1,0 +1,8 @@
+streamlit>=1.38.0
+supabase>=2.7.0
+google-api-python-client>=2.140.0
+google-auth>=2.34.0
+pandas>=2.2.0
+opencv-python>=4.10.0.84
+ultralytics>=8.2.0
+numpy>=1.26.0
