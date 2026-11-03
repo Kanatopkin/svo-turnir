@@ -1,4 +1,5 @@
 import os
+import json
 import streamlit as st
 import pandas as pd
 from db import get_db, calculate_team_score
@@ -26,6 +27,16 @@ def render_video_file(file_path: str):
         st.warning("Файл видео пуст или поврежден.")
 
 
+def load_cached_report(report_path: str) -> dict | None:
+    if os.path.exists(report_path):
+        try:
+            with open(report_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
 st.sidebar.title("⚖️ Пульт ГСК (Локальный)")
 mode = st.sidebar.radio(
     "Раздел судейской коллегии",
@@ -36,6 +47,11 @@ mode = st.sidebar.radio(
         "Экспорт официального протокола (Excel)",
     ],
 )
+
+st.sidebar.divider()
+if st.sidebar.button("🛑 Выключить сервер ГСК"):
+    st.sidebar.warning("Сервер остановлен. Можете закрыть вкладку браузера.")
+    os._exit(0)
 
 if mode == "Проверка видео и AI-судейство":
     st.title("Локальное рабочее место судьи (ГСК)")
@@ -80,18 +96,28 @@ if mode == "Проверка видео и AI-судейство":
         st.divider()
 
         for p in roster:
+            local_raw_path = os.path.join(
+                VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_raw.mp4"
+            )
+            local_ai_path = os.path.join(
+                VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_yolo.mp4"
+            )
+            local_report_path = os.path.join(
+                VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_report.json"
+            )
+
+            cached_report = load_cached_report(local_report_path)
+            ai_badge = (
+                f" | 🤖 AI-разбор: {cached_report['valid_reps']} зач. / {cached_report['invalid_reps']} ош."
+                if cached_report
+                else ""
+            )
+
             with st.expander(
-                f"{p['full_name']} ({p['class_name']} кл.) — Статус: {p['video_status']} | Зачтено: {p.get('verified_reps') or 0}",
+                f"{p['full_name']} ({p['class_name']} кл.) — Статус: {p['video_status']} | Зачтено ГСК: {p.get('verified_reps') or 0}{ai_badge}",
                 expanded=(p["video_status"] == "uploaded"),
             ):
                 col_video, col_judge = st.columns([3, 2])
-
-                local_raw_path = os.path.join(
-                    VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_raw.mp4"
-                )
-                local_ai_path = os.path.join(
-                    VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_yolo.mp4"
-                )
 
                 with col_video:
                     if not p.get("video_drive_id"):
@@ -116,11 +142,12 @@ if mode == "Проверка видео и AI-судейство":
                                 if os.path.exists(local_ai_path):
                                     os.remove(local_ai_path)
                                 report = analyze_pullup_video(local_raw_path, local_ai_path)
-                                st.session_state[f"ai_reps_{p['id']}"] = report["valid_reps"]
-                                st.session_state[f"ai_note_{p['id']}"] = report["judge_note"]
-                                st.success(
-                                    f"Готово! Чистых повторений: {report['valid_reps']}, ошибок: {report['invalid_reps']}"
-                                )
+                                with open(local_report_path, "w", encoding="utf-8") as rf:
+                                    json.dump(report, rf, ensure_ascii=False, indent=2)
+
+                                # Напрямую обновляем ключи виджетов ввода, чтобы значения сразу появились на экране
+                                st.session_state[f"reps_in_{p['id']}"] = int(report["valid_reps"])
+                                st.session_state[f"note_in_{p['id']}"] = str(report["judge_note"])
                                 st.rerun()
 
                         if os.path.exists(local_ai_path) and os.path.exists(local_raw_path):
@@ -143,23 +170,75 @@ if mode == "Проверка видео и AI-судейство":
                             )
 
                 with col_judge:
-                    default_reps = st.session_state.get(
-                        f"ai_reps_{p['id']}", p.get("verified_reps") or 0
-                    )
-                    default_note = st.session_state.get(
-                        f"ai_note_{p['id']}", p.get("judge_note") or ""
-                    )
+                    # Отображение сводки компьютерного зрения YOLO-Pose
+                    if cached_report:
+                        with st.container(border=True):
+                            st.markdown("**📊 Результаты анализа ИИ (YOLO-Pose)**")
+                            mc1, mc2, mc3 = st.columns(3)
+                            mc1.metric("Попыток", cached_report.get("total_attempts", 0))
+                            mc2.metric("✅ Засчитано", cached_report.get("valid_reps", 0))
+                            mc3.metric("❌ Ошибок", cached_report.get("invalid_reps", 0))
+
+                            errors_list = cached_report.get("errors_list", [])
+                            if errors_list:
+                                st.markdown("**⚠️ Зафиксированные ошибки техники:**")
+                                for err_item in errors_list:
+                                    st.markdown(f"- {err_item}")
+                            else:
+                                st.success("Нарушений техники не обнаружено.")
+
+                            rep_log = cached_report.get("rep_log", [])
+                            if rep_log:
+                                with st.expander("Повторения по таймкодам"):
+                                    for r_item in rep_log:
+                                        icon = "✅" if r_item["status"] == "Зачет" else "❌"
+                                        st.caption(
+                                            f"{icon} **#{r_item['attempt']}** ({r_item['time_sec']} сек) — {r_item['reason']}"
+                                        )
+
+                            if st.button(
+                                "⤵️ Перенести данные ИИ в протокол судьи",
+                                key=f"fill_ai_{p['id']}",
+                                use_container_width=True,
+                            ):
+                                st.session_state[f"reps_in_{p['id']}"] = int(
+                                    cached_report.get("valid_reps", 0)
+                                )
+                                st.session_state[f"note_in_{p['id']}"] = str(
+                                    cached_report.get("judge_note", "")
+                                )
+                                st.rerun()
+
+                    # Инициализация значений виджетов при первом открытии
+                    if f"reps_in_{p['id']}" not in st.session_state:
+                        if p.get("verified_reps") is not None:
+                            st.session_state[f"reps_in_{p['id']}"] = int(p["verified_reps"])
+                        elif cached_report:
+                            st.session_state[f"reps_in_{p['id']}"] = int(
+                                cached_report.get("valid_reps", 0)
+                            )
+                        else:
+                            st.session_state[f"reps_in_{p['id']}"] = 0
+
+                    if f"note_in_{p['id']}" not in st.session_state:
+                        if p.get("judge_note"):
+                            st.session_state[f"note_in_{p['id']}"] = str(p["judge_note"])
+                        elif cached_report:
+                            st.session_state[f"note_in_{p['id']}"] = str(
+                                cached_report.get("judge_note", "")
+                            )
+                        else:
+                            st.session_state[f"note_in_{p['id']}"] = ""
 
                     reps_val = st.number_input(
                         "Засчитанные чистые повторения",
                         min_value=0,
                         max_value=200,
-                        value=int(default_reps),
                         key=f"reps_in_{p['id']}",
                     )
                     note_val = st.text_area(
-                        "Судейский комментарий / таймкоды нарушений",
-                        value=default_note,
+                        "Судейский комментарий / описание ошибок и таймкоды",
+                        height=130,
                         key=f"note_in_{p['id']}",
                     )
 
