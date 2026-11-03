@@ -55,8 +55,10 @@ def analyze_pullup_video(
 ) -> dict:
     """
     Локальный анализатор техники подтягиваний на базе Ultralytics YOLO-Pose.
-    Фиксирует пересечение линии хвата подбородком (оценка по точкам головы и плеч),
-    полное разгибание локтей в нижней фазе и угол раскачки корпуса (бедра-плечи).
+    Фиксирует каждую попытку, зачетные повторения и детальный список ошибок с таймкодами:
+    - Недоразгиб локтей в нижнем висе (с указанием максимального угла разгибания);
+    - Маятниковая раскачка / киппинг корпуса (с указанием угла отклонения от вертикали);
+    - Недотяг подбородка до уровня перекладины при попытке подъема.
     """
     from ultralytics import YOLO
 
@@ -71,7 +73,6 @@ def analyze_pullup_video(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Записываем во временный файл, затем перепаковываем в браузерный H.264
     raw_out_path = output_path.replace(".mp4", "_raw_cv.mp4")
     out = None
     for codec in ["avc1", "H264", "mp4v"]:
@@ -88,10 +89,17 @@ def analyze_pullup_video(
     state = "hanging"
     valid_reps = 0
     invalid_reps = 0
+    attempt_num = 0
     notes = []
+    rep_log = []
+
     bar_y = None
     fully_extended_in_bottom = True
+    max_bottom_elbow_angle = 180.0
     max_swing_in_rep = 0.0
+    pulling_started = False
+    min_chin_y_in_pull = 99999.0
+    min_elbow_in_pull = 180.0
 
     frame_idx = 0
     while cap.isOpened():
@@ -99,6 +107,7 @@ def analyze_pullup_video(
         if not ret:
             break
         frame_idx += 1
+        time_sec = round(frame_idx / fps, 1)
 
         results = model(frame, verbose=False)
         annotated = results[0].plot()
@@ -112,7 +121,7 @@ def analyze_pullup_video(
                 l_wr, r_wr = kpts[9], kpts[10]
                 l_hip, r_hip = kpts[11], kpts[12]
 
-                # Определение линии перекладины по положению запястий
+                # Определение линии перекладины по запястьям
                 valid_wr_y = [pt[1] for pt in (l_wr, r_wr) if pt[1] > 0]
                 if valid_wr_y:
                     curr_wr_y = float(np.mean(valid_wr_y))
@@ -126,7 +135,7 @@ def analyze_pullup_video(
                     angles.append(calculate_angle(r_sh, r_el, r_wr))
                 elbow_angle = float(np.mean(angles)) if angles else 180.0
 
-                # Оценка положения подбородка (интерполяция между носом и линией плеч)
+                # Оценка положения подбородка
                 sh_y = (
                     float(np.mean([pt[1] for pt in (l_sh, r_sh) if pt[1] > 0]))
                     if (l_sh[1] > 0 or r_sh[1] > 0)
@@ -138,36 +147,90 @@ def analyze_pullup_video(
                     else float(nose[1])
                 )
 
-                # Оценка угла отклонения корпуса от вертикали (раскачка / киппинг)
+                # Угол отклонения корпуса (раскачка / киппинг)
                 swing_deg = 0.0
                 if l_sh[1] > 0 and l_hip[1] > 0:
                     dx = abs(float(l_hip[0] - l_sh[0]))
                     dy = abs(float(l_hip[1] - l_sh[1])) + 1e-5
                     swing_deg = float(np.degrees(np.arctan2(dx, dy)))
 
-                # Логика фаз подтягивания
+                # Фиксация нижней фазы виса
                 if elbow_angle >= elbow_ext_thresh:
+                    # Если участник сгибал руки (< 115°), но опустился вниз, так и не пересекая гриф подбородком
+                    if state == "hanging" and pulling_started and min_elbow_in_pull < 115.0 and bar_y is not None:
+                        if min_chin_y_in_pull > bar_y:
+                            attempt_num += 1
+                            invalid_reps += 1
+                            err_text = f"Попытка #{attempt_num} [{time_sec}с]: Недотяг — подбородок ниже перекладины"
+                            notes.append(err_text)
+                            rep_log.append({
+                                "attempt": attempt_num,
+                                "time_sec": time_sec,
+                                "status": "Ошибка",
+                                "reason": "Недотяг (подбородок не пересек линию перекладины)",
+                            })
+                    pulling_started = False
+                    min_chin_y_in_pull = 99999.0
+                    min_elbow_in_pull = 180.0
                     fully_extended_in_bottom = True
+                    max_bottom_elbow_angle = max(max_bottom_elbow_angle, elbow_angle)
                     if state == "top":
                         state = "hanging"
                         max_swing_in_rep = 0.0
+                else:
+                    if state == "hanging":
+                        max_bottom_elbow_angle = max(max_bottom_elbow_angle, elbow_angle)
+                        if elbow_angle < 135.0:
+                            pulling_started = True
+                            min_elbow_in_pull = min(min_elbow_in_pull, elbow_angle)
+                            if chin_y > 0:
+                                min_chin_y_in_pull = min(min_chin_y_in_pull, chin_y)
 
+                # Проверка верхней мертвой точки
                 if state == "hanging" and bar_y is not None and chin_y > 0:
                     max_swing_in_rep = max(max_swing_in_rep, swing_deg)
                     if chin_y <= bar_y and elbow_angle < 115.0:
                         state = "top"
-                        time_sec = round(frame_idx / fps, 1)
+                        attempt_num += 1
+                        pulling_started = False
+                        min_chin_y_in_pull = 99999.0
+                        min_elbow_in_pull = 180.0
+
+                        rep_errors = []
                         if not fully_extended_in_bottom:
+                            rep_errors.append(
+                                f"недоразгиб локтей в висе ({int(max_bottom_elbow_angle)}° при норме ≥{int(elbow_ext_thresh)}°)"
+                            )
+                        if max_swing_in_rep > swing_thresh_deg:
+                            rep_errors.append(
+                                f"раскачка корпуса / киппинг ({int(max_swing_in_rep)}° при норме ≤{int(swing_thresh_deg)}°)"
+                            )
+
+                        if rep_errors:
                             invalid_reps += 1
-                            notes.append(f"[{time_sec}с] Недоразгиб локтей в висе")
-                        elif max_swing_in_rep > swing_thresh_deg:
-                            invalid_reps += 1
-                            notes.append(f"[{time_sec}с] Раскачка корпуса ({max_swing_in_rep:.0f}°)")
+                            reason_str = ", ".join(rep_errors)
+                            err_msg = f"Попытка #{attempt_num} [{time_sec}с]: НЕ ЗАЧТЕНО — {reason_str}"
+                            notes.append(err_msg)
+                            rep_log.append({
+                                "attempt": attempt_num,
+                                "time_sec": time_sec,
+                                "status": "Ошибка",
+                                "reason": reason_str.capitalize(),
+                            })
                         else:
                             valid_reps += 1
-                        fully_extended_in_bottom = False
+                            rep_log.append({
+                                "attempt": attempt_num,
+                                "time_sec": time_sec,
+                                "status": "Зачет",
+                                "reason": "Чистое повторение",
+                            })
 
-                # Отрисовка телеметрии на кадре
+                        fully_extended_in_bottom = False
+                        max_bottom_elbow_angle = elbow_angle
+                        max_swing_in_rep = 0.0
+
+                # Отрисовка телеметрии на видео
                 if bar_y is not None:
                     cv2.line(annotated, (0, int(bar_y)), (width, int(bar_y)), (0, 255, 255), 2)
                 cv2.putText(
@@ -185,7 +248,6 @@ def analyze_pullup_video(
     cap.release()
     out.release()
 
-    # Перекодируем в H.264 для корректной работы в HTML5-плеере Streamlit
     convert_to_browser_mp4(raw_out_path, output_path)
     if os.path.exists(raw_out_path) and raw_out_path != output_path:
         try:
@@ -193,14 +255,24 @@ def analyze_pullup_video(
         except OSError:
             pass
 
-    summary_note = "; ".join(notes[:5])
-    if len(notes) > 5:
-        summary_note += f" (и еще {len(notes) - 5})"
+    if notes:
+        summary_note = (
+            f"Засчитано: {valid_reps} (всего попыток: {attempt_num}, ошибок: {invalid_reps}).\n"
+            + "\n".join(notes)
+        )
+    else:
+        summary_note = (
+            f"Засчитано чистых повторений: {valid_reps} (всего попыток: {attempt_num}). "
+            "Нарушений техники не зафиксировано (AI)."
+        )
 
     return {
+        "total_attempts": attempt_num,
         "valid_reps": valid_reps,
         "invalid_reps": invalid_reps,
-        "judge_note": summary_note if summary_note else "Нарушений техники не зафиксировано (AI)",
+        "errors_list": notes,
+        "rep_log": rep_log,
+        "judge_note": summary_note,
         "duration_sec": round(total_frames / fps, 1),
         "width": width,
         "height": height,
