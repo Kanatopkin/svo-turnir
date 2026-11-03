@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 from db import get_db, calculate_team_score
 from gdrive import download_video_to_local
-from cv_analyzer import analyze_pullup_video
+from cv_analyzer import analyze_pullup_video, convert_to_browser_mp4
 
 st.set_page_config(
     page_title="Локальный пульт ГСК — Судейство и AI-видеоанализ",
@@ -15,6 +15,16 @@ VIDEO_CACHE_DIR = os.path.join(os.getcwd(), "local_video_cache")
 os.makedirs(VIDEO_CACHE_DIR, exist_ok=True)
 
 db = get_db()
+
+
+def render_video_file(file_path: str):
+    """Безопасная передача локального видеофайла в плеер Streamlit через байтовый поток."""
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        with open(file_path, "rb") as vf:
+            st.video(vf.read())
+    else:
+        st.warning("Файл видео пуст или поврежден.")
+
 
 st.sidebar.title("⚖️ Пульт ГСК (Локальный)")
 mode = st.sidebar.radio(
@@ -37,7 +47,9 @@ if mode == "Проверка видео и AI-судейство":
     if not teams:
         st.info("Зарегистрированных школьных команд пока нет.")
     else:
-        team_options = {f"{t['school_name']} ({t['municipality']}) — [{t['status']}]": t for t in teams}
+        team_options = {
+            f"{t['school_name']} ({t['municipality']}) — [{t['status']}]": t for t in teams
+        }
         selected_label = st.selectbox("Выберите команду для проверки", list(team_options.keys()))
         team = team_options[selected_label]
 
@@ -56,9 +68,13 @@ if mode == "Проверка видео и AI-судейство":
         c1.metric("Командный результат (Сумма Топ-10)", score)
         c2.metric("Статус публикации", "Опубликована" if team["is_published"] else "Скрыта")
         with c3:
-            pub_label = "Снять с публикации" if team["is_published"] else "Опубликовать в протоколе"
+            pub_label = (
+                "Снять с публикации" if team["is_published"] else "Опубликовать в протоколе"
+            )
             if st.button(pub_label, use_container_width=True):
-                db.table("teams").update({"is_published": not team["is_published"]}).eq("id", team["id"]).execute()
+                db.table("teams").update({"is_published": not team["is_published"]}).eq(
+                    "id", team["id"]
+                ).execute()
                 st.rerun()
 
         st.divider()
@@ -70,8 +86,12 @@ if mode == "Проверка видео и AI-судейство":
             ):
                 col_video, col_judge = st.columns([3, 2])
 
-                local_raw_path = os.path.join(VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_raw.mp4")
-                local_ai_path = os.path.join(VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_yolo.mp4")
+                local_raw_path = os.path.join(
+                    VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_raw.mp4"
+                )
+                local_ai_path = os.path.join(
+                    VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_yolo.mp4"
+                )
 
                 with col_video:
                     if not p.get("video_drive_id"):
@@ -80,29 +100,47 @@ if mode == "Проверка видео и AI-судейство":
                         b_dl, b_ai = st.columns(2)
                         if b_dl.button("📥 Скачать с Google Drive в кэш", key=f"dl_{p['id']}"):
                             with st.spinner("Скачивание оригинала с Google Drive..."):
+                                if os.path.exists(local_raw_path):
+                                    os.remove(local_raw_path)
                                 download_video_to_local(p["video_drive_id"], local_raw_path)
+                                convert_to_browser_mp4(local_raw_path, local_raw_path)
                                 st.success("Видео сохранено локально!")
+                                st.rerun()
 
                         if b_ai.button("🤖 Запустить локальный YOLO-Pose разбор", key=f"ai_{p['id']}"):
                             if not os.path.exists(local_raw_path):
                                 with st.spinner("Скачивание оригинала с Google Drive..."):
                                     download_video_to_local(p["video_drive_id"], local_raw_path)
+                                    convert_to_browser_mp4(local_raw_path, local_raw_path)
                             with st.spinner("Выполняется локальный нейросетевой анализ техники..."):
+                                if os.path.exists(local_ai_path):
+                                    os.remove(local_ai_path)
                                 report = analyze_pullup_video(local_raw_path, local_ai_path)
                                 st.session_state[f"ai_reps_{p['id']}"] = report["valid_reps"]
                                 st.session_state[f"ai_note_{p['id']}"] = report["judge_note"]
                                 st.success(
                                     f"Готово! Чистых повторений: {report['valid_reps']}, ошибок: {report['invalid_reps']}"
                                 )
+                                st.rerun()
 
-                        if os.path.exists(local_ai_path):
+                        if os.path.exists(local_ai_path) and os.path.exists(local_raw_path):
+                            tab_ai, tab_raw = st.tabs(
+                                ["🤖 Видео с разметкой YOLO-Pose", "📹 Оригинал видео"]
+                            )
+                            with tab_ai:
+                                render_video_file(local_ai_path)
+                            with tab_raw:
+                                render_video_file(local_raw_path)
+                        elif os.path.exists(local_ai_path):
                             st.caption("Видео с наложенной разметкой YOLO-Pose:")
-                            st.video(local_ai_path)
+                            render_video_file(local_ai_path)
                         elif os.path.exists(local_raw_path):
                             st.caption("Оригинальное видео (из локального кэша):")
-                            st.video(local_raw_path)
+                            render_video_file(local_raw_path)
                         elif p.get("video_url"):
-                            st.markdown(f"[Открыть видео в облаке Google Drive]({p['video_url']})")
+                            st.markdown(
+                                f"[🔗 Открыть видео в облаке Google Drive]({p['video_url']})"
+                            )
 
                 with col_judge:
                     default_reps = st.session_state.get(
@@ -166,7 +204,9 @@ elif mode == "Синхронизация видео с Google Drive":
         for idx, p in enumerate(all_parts):
             if p.get("video_drive_id"):
                 dest = os.path.join(VIDEO_CACHE_DIR, f"team_{p['team_id']}_p_{p['id']}_raw.mp4")
-                download_video_to_local(p["video_drive_id"], dest)
+                if not os.path.exists(dest):
+                    download_video_to_local(p["video_drive_id"], dest)
+                    convert_to_browser_mp4(dest, dest)
             prog.progress((idx + 1) / max(len(all_parts), 1))
         st.success("Все видеозаписи синхронизированы для офлайн-просмотра и нейросетевой проверки!")
 
@@ -176,15 +216,22 @@ elif mode == "Управление финальной сеткой (Топ-8)":
     if st.button("🔄 Сформировать 1/4 финала по Топ-8 участникам опубликованных команд"):
         pub_teams = {
             t["id"]: t
-            for t in (db.table("teams").select("*").eq("is_published", True).execute().data or [])
+            for t in (
+                db.table("teams").select("*").eq("is_published", True).execute().data or []
+            )
         }
-        all_p = db.table("participants").select("*").eq("video_status", "approved").execute().data or []
+        all_p = (
+            db.table("participants").select("*").eq("video_status", "approved").execute().data
+            or []
+        )
         qualifiers = [p for p in all_p if p["team_id"] in pub_teams]
         qualifiers.sort(key=lambda x: x.get("verified_reps") or 0, reverse=True)
         top8 = qualifiers[:8]
 
         if len(top8) < 8:
-            st.error(f"Для генерации сетки нужно минимум 8 участников с утвержденным результатом (сейчас: {len(top8)}).")
+            st.error(
+                f"Для генерации сетки нужно минимум 8 участников с утвержденным результатом (сейчас: {len(top8)})."
+            )
         else:
             db.table("final_matches").delete().neq("id", 0).execute()
             pairs = [(0, 7), (1, 6), (2, 5), (3, 4)]
@@ -211,10 +258,14 @@ elif mode == "Управление финальной сеткой (Топ-8)":
                 st.markdown(f"**Раунд: {m['round'].upper()} | Матч #{m['match_no']}**")
                 c1, c2 = st.columns(2)
                 if c1.button(f"Победитель: {pa['full_name']}", key=f"win_a_{m['id']}"):
-                    db.table("final_matches").update({"winner_id": pa["id"]}).eq("id", m["id"]).execute()
+                    db.table("final_matches").update({"winner_id": pa["id"]}).eq(
+                        "id", m["id"]
+                    ).execute()
                     st.rerun()
                 if c2.button(f"Победитель: {pb['full_name']}", key=f"win_b_{m['id']}"):
-                    db.table("final_matches").update({"winner_id": pb["id"]}).eq("id", m["id"]).execute()
+                    db.table("final_matches").update({"winner_id": pb["id"]}).eq(
+                        "id", m["id"]
+                    ).execute()
                     st.rerun()
 
 elif mode == "Экспорт официального протокола (Excel)":
