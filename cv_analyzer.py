@@ -1,5 +1,8 @@
+import os
+import subprocess
 import cv2
 import numpy as np
+
 
 def calculate_angle(a, b, c) -> float:
     a, b, c = np.array(a), np.array(b), np.array(c)
@@ -9,12 +12,46 @@ def calculate_angle(a, b, c) -> float:
         angle = 360.0 - angle
     return float(angle)
 
+
+def convert_to_browser_mp4(source_path: str, target_path: str) -> None:
+    """Перекодирует видео в H.264 (yuv420p) для гарантированного воспроизведения в браузере Streamlit."""
+    try:
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        temp_h264 = target_path.replace(".mp4", "_h264_tmp.mp4")
+        subprocess.run(
+            [
+                ffmpeg_exe,
+                "-y",
+                "-i",
+                source_path,
+                "-vcodec",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "fast",
+                "-movflags",
+                "+faststart",
+                temp_h264,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        os.replace(temp_h264, target_path)
+    except Exception as e:
+        print("Предупреждение перекодирования FFmpeg:", e)
+        if source_path != target_path and os.path.exists(source_path):
+            os.replace(source_path, target_path)
+
+
 def analyze_pullup_video(
     video_path: str,
     output_path: str,
     model_name: str = "yolov8n-pose.pt",
     elbow_ext_thresh: float = 155.0,
-    swing_thresh_deg: float = 20.0
+    swing_thresh_deg: float = 20.0,
 ) -> dict:
     """
     Локальный анализатор техники подтягиваний на базе Ultralytics YOLO-Pose.
@@ -22,6 +59,7 @@ def analyze_pullup_video(
     полное разгибание локтей в нижней фазе и угол раскачки корпуса (бедра-плечи).
     """
     from ultralytics import YOLO
+
     model = YOLO(model_name)
 
     cap = cv2.VideoCapture(video_path)
@@ -33,8 +71,19 @@ def analyze_pullup_video(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    # Записываем во временный файл, затем перепаковываем в браузерный H.264
+    raw_out_path = output_path.replace(".mp4", "_raw_cv.mp4")
+    out = None
+    for codec in ["avc1", "H264", "mp4v"]:
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        temp_writer = cv2.VideoWriter(raw_out_path, fourcc, fps, (width, height))
+        if temp_writer.isOpened():
+            out = temp_writer
+            break
+
+    if out is None:
+        cap.release()
+        raise RuntimeError("Не удалось инициализировать VideoWriter для записи видео.")
 
     state = "hanging"
     valid_reps = 0
@@ -78,8 +127,16 @@ def analyze_pullup_video(
                 elbow_angle = float(np.mean(angles)) if angles else 180.0
 
                 # Оценка положения подбородка (интерполяция между носом и линией плеч)
-                sh_y = float(np.mean([pt[1] for pt in (l_sh, r_sh) if pt[1] > 0])) if (l_sh[1] > 0 or r_sh[1] > 0) else 0.0
-                chin_y = float(nose[1] + 0.35 * (sh_y - nose[1])) if (nose[1] > 0 and sh_y > 0) else float(nose[1])
+                sh_y = (
+                    float(np.mean([pt[1] for pt in (l_sh, r_sh) if pt[1] > 0]))
+                    if (l_sh[1] > 0 or r_sh[1] > 0)
+                    else 0.0
+                )
+                chin_y = (
+                    float(nose[1] + 0.35 * (sh_y - nose[1]))
+                    if (nose[1] > 0 and sh_y > 0)
+                    else float(nose[1])
+                )
 
                 # Оценка угла отклонения корпуса от вертикали (раскачка / киппинг)
                 swing_deg = 0.0
@@ -115,7 +172,7 @@ def analyze_pullup_video(
                     cv2.line(annotated, (0, int(bar_y)), (width, int(bar_y)), (0, 255, 255), 2)
                 cv2.putText(
                     annotated,
-                    f"Зачет: {valid_reps} | Ошибки: {invalid_reps} | Локоть: {int(elbow_angle)} deg",
+                    f"Reps: {valid_reps} | Err: {invalid_reps} | Elbow: {int(elbow_angle)} deg",
                     (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
@@ -127,6 +184,14 @@ def analyze_pullup_video(
 
     cap.release()
     out.release()
+
+    # Перекодируем в H.264 для корректной работы в HTML5-плеере Streamlit
+    convert_to_browser_mp4(raw_out_path, output_path)
+    if os.path.exists(raw_out_path) and raw_out_path != output_path:
+        try:
+            os.remove(raw_out_path)
+        except OSError:
+            pass
 
     summary_note = "; ".join(notes[:5])
     if len(notes) > 5:
