@@ -1,7 +1,7 @@
 import io
 import os
 import streamlit as st
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
@@ -9,8 +9,15 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 @st.cache_resource
 def get_drive_service():
-    creds_info = dict(st.secrets["gdrive_service_account"])
-    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    g_cfg = st.secrets["gdrive"]
+    creds = Credentials(
+        token=None,
+        refresh_token=g_cfg["refresh_token"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=g_cfg["client_id"],
+        client_secret=g_cfg["client_secret"],
+        scopes=SCOPES,
+    )
     return build("drive", "v3", credentials=creds)
 
 def get_or_create_folder(service, folder_name: str, parent_id: str) -> str:
@@ -19,7 +26,12 @@ def get_or_create_folder(service, folder_name: str, parent_id: str) -> str:
         f"mimeType = 'application/vnd.google-apps.folder' and "
         f"'{parent_id}' in parents and trashed = false"
     )
-    results = service.files().list(q=query, fields="files(id, name)").execute()
+    results = service.files().list(
+        q=query,
+        fields="files(id, name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
     files = results.get("files", [])
     if files:
         return files[0]["id"]
@@ -28,7 +40,11 @@ def get_or_create_folder(service, folder_name: str, parent_id: str) -> str:
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [parent_id],
     }
-    folder = service.files().create(body=metadata, fields="id").execute()
+    folder = service.files().create(
+        body=metadata,
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
     return folder["id"]
 
 def upload_participant_video(file_bytes: bytes, filename: str, mime_type: str, team_id: int, participant_id: int) -> dict:
@@ -46,7 +62,8 @@ def upload_participant_video(file_bytes: bytes, filename: str, mime_type: str, t
     uploaded = service.files().create(
         body=file_metadata,
         media_body=media,
-        fields="id, name, size, webViewLink"
+        fields="id, name, size, webViewLink",
+        supportsAllDrives=True,
     ).execute()
     return uploaded
 
@@ -55,7 +72,7 @@ def delete_drive_file(file_id: str):
         return
     try:
         service = get_drive_service()
-        service.files().delete(fileId=file_id).execute()
+        service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
     except Exception:
         pass
 
@@ -64,7 +81,7 @@ def download_video_to_local(file_id: str, dest_path: str) -> str:
     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
         return dest_path
     service = get_drive_service()
-    request = service.files().get_media(fileId=file_id)
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     with io.FileIO(dest_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request)
         done = False
