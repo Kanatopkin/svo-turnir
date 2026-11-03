@@ -9,7 +9,7 @@ st.set_page_config(
     layout="wide",
 )
 
-MAX_VIDEO_MB = 30
+MAX_VIDEO_MB = 50
 MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024
 
 st.sidebar.title("🏅 Турнир по подтягиваниям")
