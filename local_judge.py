@@ -2,9 +2,13 @@ import os
 import json
 import streamlit as st
 import pandas as pd
+import cv2
 from db import get_db, calculate_team_score
 from gdrive import download_video_to_local
 from cv_analyzer import analyze_pullup_video, convert_to_browser_mp4
+from camera_calibrator import CameraCalibrator
+from setup_validator import SetupValidator
+from protocol_generator import generate_protocol_pdf, generate_protocol_docx
 
 st.set_page_config(
     page_title="Локальный пульт ГСК — Судейство и AI-видеоанализ",
@@ -56,7 +60,7 @@ if st.sidebar.button("🛑 Выключить сервер ГСК"):
 if mode == "Проверка видео и AI-судейство":
     st.title("Локальное рабочее место судьи (ГСК)")
     st.caption(
-        "Видео скачивается с Google Drive в локальный кэш компьютера судьи для мгновенного воспроизведения и локального анализа через YOLO-Pose."
+        "Видео скачивается с Google Drive в локальный кэш компьютера судьи для мгновенного воспроизведения и локального судейства через валидированный гибрид YOLO-Pose + MediaPipe + Anchor Grip Lock (контроль виса >= 0.8с, защита от срывов скелета, мягкий порог перекладины)."
     )
 
     teams = db.table("teams").select("*").order("id").execute().data or []
@@ -123,8 +127,8 @@ if mode == "Проверка видео и AI-судейство":
                     if not p.get("video_drive_id"):
                         st.warning("Участник еще не загрузил видео.")
                     else:
-                        b_dl, b_ai = st.columns(2)
-                        if b_dl.button("📥 Скачать с Google Drive в кэш", key=f"dl_{p['id']}"):
+                        b_dl, b_chk, b_ai = st.columns(3)
+                        if b_dl.button("📥 Скачать видео", key=f"dl_{p['id']}", use_container_width=True):
                             with st.spinner("Скачивание оригинала с Google Drive..."):
                                 if os.path.exists(local_raw_path):
                                     os.remove(local_raw_path)
@@ -133,33 +137,65 @@ if mode == "Проверка видео и AI-судейство":
                                 st.success("Видео сохранено локально!")
                                 st.rerun()
 
-                        if b_ai.button("🤖 Запустить локальный YOLO-Pose разбор", key=f"ai_{p['id']}"):
+                        if b_chk.button("📐 Чек-ин помоста", key=f"chk_{p['id']}", use_container_width=True):
                             if not os.path.exists(local_raw_path):
                                 with st.spinner("Скачивание оригинала с Google Drive..."):
                                     download_video_to_local(p["video_drive_id"], local_raw_path)
                                     convert_to_browser_mp4(local_raw_path, local_raw_path)
-                            with st.spinner("Выполняется локальный нейросетевой анализ техники..."):
+                            with st.spinner("Валидация геометрии помоста и кадрирования..."):
+                                from ultralytics import YOLO
+                                y_temp = YOLO("yolov8n-pose.pt")
+                                calib_res = CameraCalibrator().calibrate_video(local_raw_path, sample_frames=15)
+                                setup_res = SetupValidator().validate_video(local_raw_path, y_temp, calib_info=calib_res)
+                                chk_img_path = os.path.join(VIDEO_CACHE_DIR, f"setup_check_{p['id']}.jpg")
+                                if setup_res.get("annotated_frame") is not None:
+                                    cv2.imwrite(chk_img_path, setup_res["annotated_frame"])
+                                    st.session_state[f"chk_img_{p['id']}"] = chk_img_path
+                                st.session_state[f"chk_res_{p['id']}"] = setup_res
+                                st.session_state[f"calib_res_{p['id']}"] = calib_res
+                                st.rerun()
+
+                        if b_ai.button("🤖 Запустить AI (Гибрид)", key=f"ai_{p['id']}", use_container_width=True):
+                            if not os.path.exists(local_raw_path):
+                                with st.spinner("Скачивание оригинала с Google Drive..."):
+                                    download_video_to_local(p["video_drive_id"], local_raw_path)
+                                    convert_to_browser_mp4(local_raw_path, local_raw_path)
+                            with st.spinner("Выполняется гибридный анализ техники (YOLO-Pose + MediaPipe + Anchor Grip Lock)..."):
                                 if os.path.exists(local_ai_path):
                                     os.remove(local_ai_path)
                                 report = analyze_pullup_video(local_raw_path, local_ai_path)
+                                
+                                # Безопасное сохранение отчета с default=str для NumPy типов
                                 with open(local_report_path, "w", encoding="utf-8") as rf:
-                                    json.dump(report, rf, ensure_ascii=False, indent=2)
+                                    json.dump(report, rf, ensure_ascii=False, indent=2, default=str)
 
-                                # Напрямую обновляем ключи виджетов ввода, чтобы значения сразу появились на экране
+                                # Напрямую обновляем ключи виджетов ввода
                                 st.session_state[f"reps_in_{p['id']}"] = int(report["valid_reps"])
                                 st.session_state[f"note_in_{p['id']}"] = str(report["judge_note"])
                                 st.rerun()
 
+                        # Отображение результатов предстартового чек-ина
+                        chk_res = st.session_state.get(f"chk_res_{p['id']}")
+                        chk_img = st.session_state.get(f"chk_img_{p['id']}")
+                        if chk_res:
+                            with st.expander(f"📐 Результат чек-ина помоста: [{chk_res.get('verdict')}]", expanded=True):
+                                if chk_img and os.path.exists(chk_img):
+                                    st.image(chk_img, caption="Контрольные поля кадра и детекция спортсмена", use_column_width=True)
+                                st.info(chk_res.get("summary", ""))
+                                for ci in chk_res.get("checklist", []):
+                                    ic = "✅" if ci["status"] == "PASS" else ("⚠️" if ci["status"] == "WARN" else "❌")
+                                    st.caption(f"{ic} **{ci['rule']}**: {ci['value']} — {ci['desc']}")
+
                         if os.path.exists(local_ai_path) and os.path.exists(local_raw_path):
                             tab_ai, tab_raw = st.tabs(
-                                ["🤖 Видео с разметкой YOLO-Pose", "📹 Оригинал видео"]
+                                ["🤖 Видео с разметкой AI-Судьи (YOLO + MediaPipe)", "📹 Оригинал видео"]
                             )
                             with tab_ai:
                                 render_video_file(local_ai_path)
                             with tab_raw:
                                 render_video_file(local_raw_path)
                         elif os.path.exists(local_ai_path):
-                            st.caption("Видео с наложенной разметкой YOLO-Pose:")
+                            st.caption("Видео с разметкой AI-Судьи (YOLO-Pose + MediaPipe):")
                             render_video_file(local_ai_path)
                         elif os.path.exists(local_raw_path):
                             st.caption("Оригинальное видео (из локального кэша):")
@@ -170,10 +206,9 @@ if mode == "Проверка видео и AI-судейство":
                             )
 
                 with col_judge:
-                    # Отображение сводки компьютерного зрения YOLO-Pose
                     if cached_report:
                         with st.container(border=True):
-                            st.markdown("**📊 Результаты анализа ИИ (YOLO-Pose)**")
+                            st.markdown("**📊 Результаты AI-судейства (YOLO-Pose + MediaPipe + Anchor Grip Lock)**")
                             mc1, mc2, mc3 = st.columns(3)
                             mc1.metric("Попыток", cached_report.get("total_attempts", 0))
                             mc2.metric("✅ Засчитано", cached_report.get("valid_reps", 0))
@@ -209,7 +244,87 @@ if mode == "Проверка видео и AI-судейство":
                                 )
                                 st.rerun()
 
-                    # Инициализация значений виджетов при первом открытии
+                            calib_d = cached_report.get("calib_info")
+                            setup_d = cached_report.get("setup_info")
+                            if calib_d or setup_d:
+                                with st.expander("📐 Аудит калибровки и ракурса камеры"):
+                                    if calib_d:
+                                        c_roll = calib_d.get("roll_angle_deg", 0.0)
+                                        c_pitch = calib_d.get("pitch_tilt_deg", 0.0)
+                                        st.markdown(f"**Ракурс камеры:** Roll `{c_roll:+.1f}°`, Pitch `{c_pitch:+.1f}°` [{calib_d.get('calib_status', 'OK')}]")
+                                        st.caption(calib_d.get("status_msg", ""))
+                                    if setup_d:
+                                        st.markdown(f"**Кадрирование:** `{setup_d.get('verdict', 'READY')}` — {setup_d.get('summary', '')}")
+
+                            pdf_export_path = os.path.join(VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_protocol.pdf")
+                            docx_export_path = os.path.join(VIDEO_CACHE_DIR, f"team_{team['id']}_p_{p['id']}_protocol.docx")
+
+                            st.markdown("**📜 Официальный протокол ГСК с фотофиксацией:**")
+                            col_p1, col_p2 = st.columns(2)
+                            with col_p1:
+                                if st.button("📄 Сформировать PDF", key=f"pdf_btn_{p['id']}", use_container_width=True):
+                                    with st.spinner("Создание PDF-протокола с ключевыми кадрами..."):
+                                        p_info = {
+                                            "full_name": p["full_name"],
+                                            "school_name": team.get("school_name", ""),
+                                            "municipality": team.get("municipality", ""),
+                                            "class_name": p.get("class_name", ""),
+                                        }
+                                        src_vid = local_ai_path if os.path.exists(local_ai_path) else local_raw_path
+                                        generate_protocol_pdf(
+                                            cached_report,
+                                            pdf_export_path,
+                                            video_path=src_vid,
+                                            participant_info=p_info,
+                                            calib_info=calib_d,
+                                            setup_info=setup_d,
+                                        )
+                                        st.success("PDF готов!")
+                                        st.rerun()
+
+                                if os.path.exists(pdf_export_path):
+                                    with open(pdf_export_path, "rb") as pf:
+                                        st.download_button(
+                                            "⬇️ Скачать PDF",
+                                            data=pf.read(),
+                                            file_name=f"protocol_{p['id']}_{p['full_name']}.pdf",
+                                            mime="application/pdf",
+                                            key=f"dl_pdf_{p['id']}",
+                                            use_container_width=True,
+                                        )
+
+                            with col_p2:
+                                if st.button("📝 Сформировать Word", key=f"docx_btn_{p['id']}", use_container_width=True):
+                                    with st.spinner("Создание DOCX-протокола..."):
+                                        p_info = {
+                                            "full_name": p["full_name"],
+                                            "school_name": team.get("school_name", ""),
+                                            "municipality": team.get("municipality", ""),
+                                            "class_name": p.get("class_name", ""),
+                                        }
+                                        src_vid = local_ai_path if os.path.exists(local_ai_path) else local_raw_path
+                                        generate_protocol_docx(
+                                            cached_report,
+                                            docx_export_path,
+                                            video_path=src_vid,
+                                            participant_info=p_info,
+                                            calib_info=calib_d,
+                                            setup_info=setup_d,
+                                        )
+                                        st.success("Word готов!")
+                                        st.rerun()
+
+                                if os.path.exists(docx_export_path):
+                                    with open(docx_export_path, "rb") as df:
+                                        st.download_button(
+                                            "⬇️ Скачать Word",
+                                            data=df.read(),
+                                            file_name=f"protocol_{p['id']}_{p['full_name']}.docx",
+                                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                            key=f"dl_docx_{p['id']}",
+                                            use_container_width=True,
+                                        )
+
                     if f"reps_in_{p['id']}" not in st.session_state:
                         if p.get("verified_reps") is not None:
                             st.session_state[f"reps_in_{p['id']}"] = int(p["verified_reps"])
