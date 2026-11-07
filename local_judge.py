@@ -5,7 +5,7 @@ import pandas as pd
 import cv2
 from db import get_db, calculate_team_score
 from gdrive import download_video_to_local
-from cv_analyzer import analyze_pullup_video, convert_to_browser_mp4
+from cv_analyzer import analyze_pullup_video, convert_to_browser_mp4, DEFAULT_JUDGE_PARAMS
 from camera_calibrator import CameraCalibrator
 from setup_validator import SetupValidator
 from protocol_generator import generate_protocol_pdf, generate_protocol_docx
@@ -53,6 +53,100 @@ mode = st.sidebar.radio(
 )
 
 st.sidebar.divider()
+
+with st.sidebar.expander("⚙️ Настройка чувствительности AI-судьи (ручной режим)", expanded=False):
+    st.caption("Тонкая подстройка порогов ошибок под ракурс камеры и особенности турнира.")
+
+    defaults = {
+        "min_hang_sec": 0.8,
+        "full_hang_elbow_deg": 145.0,
+        "enable_hang_check": True,
+        "asym_elbow_diff_deg": 25.0,
+        "asym_shoulder_tilt_deg": 13.0,
+        "asym_min_frames": 6,
+        "enable_asym_check": True,
+        "kipping_swing_deg": 5.5,
+        "kipping_min_frames": 4,
+        "enable_kipping_check": True,
+        "legs_apart_hip_mult": 1.55,
+        "legs_apart_min_frames": 6,
+        "enable_legs_apart_check": True,
+        "legs_crossed_min_frames": 5,
+        "enable_legs_crossed_check": True,
+        "knees_back_deg": 148.0,
+        "knees_up_hip_deg": 155.0,
+        "enable_knees_check": True,
+        "head_throw_min_frames": 20,
+        "enable_head_throw_check": True,
+    }
+
+    if st.button("🔄 Сбросить к эталонным", key="reset_params_btn", use_container_width=True):
+        for k, v in defaults.items():
+            st.session_state[f"cfg_{k}"] = v
+        st.rerun()
+
+    for k, v in defaults.items():
+        if f"cfg_{k}" not in st.session_state:
+            st.session_state[f"cfg_{k}"] = v
+
+    st.markdown("**1. Фиксация виса:**")
+    st.checkbox("Контроль виса и выпрямления рук", key="cfg_enable_hang_check")
+    st.slider("Мин. время виса (сек)", 0.3, 2.0, key="cfg_min_hang_sec", step=0.1)
+    st.slider("Мин. угол прямых рук (°)", 135.0, 165.0, key="cfg_full_hang_elbow_deg", step=1.0)
+
+    st.markdown("**2. Поочередное сгибание рук (асимметрия):**")
+    st.checkbox("Контроль асимметрии тяги", key="cfg_enable_asym_check")
+    st.slider("Макс. разница углов локтей (°)", 15.0, 45.0, key="cfg_asym_elbow_diff_deg", step=1.0)
+    st.slider("Макс. наклон линии плеч (°)", 6.0, 25.0, key="cfg_asym_shoulder_tilt_deg", step=0.5)
+    st.slider("Мин. серия кадров асимметрии", 2, 15, key="cfg_asym_min_frames", step=1)
+
+    st.markdown("**3. Рывок / киппинг:**")
+    st.checkbox("Контроль рывка / раскачки", key="cfg_enable_kipping_check")
+    st.slider("Порог отклонения корпуса (°)", 3.0, 12.0, key="cfg_kipping_swing_deg", step=0.5)
+    st.slider("Мин. серия кадров киппинга", 2, 12, key="cfg_kipping_min_frames", step=1)
+
+    st.markdown("**4. Разведение ног («ноги не вместе»):**")
+    st.checkbox("Контроль разведения ног", key="cfg_enable_legs_apart_check")
+    st.slider("Коэффициент ширины к тазу", 1.20, 2.20, key="cfg_legs_apart_hip_mult", step=0.05)
+    st.slider("Мин. серия кадров разведения", 2, 15, key="cfg_legs_apart_min_frames", step=1)
+
+    st.markdown("**5. Перекрещенные ноги:**")
+    st.checkbox("Контроль скрещивания ног", key="cfg_enable_legs_crossed_check")
+    st.slider("Мин. серия кадров скрещивания", 2, 12, key="cfg_legs_crossed_min_frames", step=1)
+
+    st.markdown("**6. Колени назад / подъем вверх:**")
+    st.checkbox("Контроль коленей и таза", key="cfg_enable_knees_check")
+    st.slider("Мин. угол в колене назад (°)", 120.0, 170.0, key="cfg_knees_back_deg", step=1.0)
+    st.slider("Мин. угол в тазу при подъеме (°)", 120.0, 175.0, key="cfg_knees_up_hip_deg", step=1.0)
+
+    st.markdown("**7. Запрокидывание головы:**")
+    st.checkbox("Контроль запрокидывания головы", key="cfg_enable_head_throw_check")
+    st.slider("Мин. серия кадров запрокидывания", 5, 40, key="cfg_head_throw_min_frames", step=1)
+
+custom_judge_params = {
+    "min_hang_sec": float(st.session_state.get("cfg_min_hang_sec", 0.8)),
+    "full_hang_elbow_deg": float(st.session_state.get("cfg_full_hang_elbow_deg", 145.0)),
+    "enable_hang_check": bool(st.session_state.get("cfg_enable_hang_check", True)),
+    "asym_elbow_diff_deg": float(st.session_state.get("cfg_asym_elbow_diff_deg", 25.0)),
+    "asym_shoulder_tilt_deg": float(st.session_state.get("cfg_asym_shoulder_tilt_deg", 13.0)),
+    "asym_min_frames": int(st.session_state.get("cfg_asym_min_frames", 6)),
+    "enable_asym_check": bool(st.session_state.get("cfg_enable_asym_check", True)),
+    "kipping_swing_deg": float(st.session_state.get("cfg_kipping_swing_deg", 5.5)),
+    "kipping_min_frames": int(st.session_state.get("cfg_kipping_min_frames", 4)),
+    "enable_kipping_check": bool(st.session_state.get("cfg_enable_kipping_check", True)),
+    "legs_apart_hip_mult": float(st.session_state.get("cfg_legs_apart_hip_mult", 1.55)),
+    "legs_apart_min_frames": int(st.session_state.get("cfg_legs_apart_min_frames", 6)),
+    "enable_legs_apart_check": bool(st.session_state.get("cfg_enable_legs_apart_check", True)),
+    "legs_crossed_min_frames": int(st.session_state.get("cfg_legs_crossed_min_frames", 5)),
+    "enable_legs_crossed_check": bool(st.session_state.get("cfg_enable_legs_crossed_check", True)),
+    "knees_back_deg": float(st.session_state.get("cfg_knees_back_deg", 148.0)),
+    "knees_up_hip_deg": float(st.session_state.get("cfg_knees_up_hip_deg", 155.0)),
+    "enable_knees_check": bool(st.session_state.get("cfg_enable_knees_check", True)),
+    "head_throw_min_frames": int(st.session_state.get("cfg_head_throw_min_frames", 20)),
+    "enable_head_throw_check": bool(st.session_state.get("cfg_enable_head_throw_check", True)),
+}
+
+st.sidebar.divider()
 if st.sidebar.button("🛑 Выключить сервер ГСК"):
     st.sidebar.warning("Сервер остановлен. Можете закрыть вкладку браузера.")
     os._exit(0)
@@ -60,7 +154,7 @@ if st.sidebar.button("🛑 Выключить сервер ГСК"):
 if mode == "Проверка видео и AI-судейство":
     st.title("Локальное рабочее место судьи (ГСК)")
     st.caption(
-        "Видео скачивается с Google Drive в локальный кэш компьютера судьи для мгновенного воспроизведения и локального судейства через валидированный гибрид YOLO-Pose + MediaPipe + Anchor Grip Lock (контроль виса >= 0.8с, защита от срывов скелета, мягкий порог перекладины)."
+        "Видео скачивается с Google Drive в локальный кэш компьютера судьи для мгновенного воспроизведения и локального судейства через валидированный гибрид YOLO-Pose + MediaPipe + Anchor Grip Lock (контроль виса >= 0.8с, детекция скрещивания/разведения ног, защита от срывов скелета, мягкий порог перекладины)."
     )
 
     teams = db.table("teams").select("*").order("id").execute().data or []
@@ -163,7 +257,12 @@ if mode == "Проверка видео и AI-судейство":
                             with st.spinner("Выполняется гибридный анализ техники (YOLO-Pose + MediaPipe + Anchor Grip Lock)..."):
                                 if os.path.exists(local_ai_path):
                                     os.remove(local_ai_path)
-                                report = analyze_pullup_video(local_raw_path, local_ai_path)
+                                report = analyze_pullup_video(
+                                    local_raw_path,
+                                    local_ai_path,
+                                    save_video=True,
+                                    custom_params=custom_judge_params,
+                                )
                                 
                                 # Безопасное сохранение отчета с default=str для NumPy типов
                                 with open(local_report_path, "w", encoding="utf-8") as rf:
